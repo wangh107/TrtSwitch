@@ -1,0 +1,330 @@
+---
+title: "TSD Section 6 RPSFTM Reporting Requirements vs. `trtswitch::rpsftm()` Outputs"
+output: html_document
+---
+
+<style>
+table td:first-child, table th:first-child { padding-right: 2em; }
+</style>
+
+## Overview
+
+NICE TSD Section 6 (Recommendation 8) lists reporting requirements for treatment switching adjustment analyses.
+This document maps each RPSFTM-specific requirement (RPSFTM1–RPSFTM10)
+to `trtswitch::rpsftm()` outputs, explains where analyst input or external
+post-processing is needed, and provides code examples where the requirement
+can be fulfilled programmatically. It is intended as both a coverage assessment
+and guidance that analysts can adapt when preparing a final report.
+
+All examples use the `immdef` (Concorde trial) dataset shipped with `trtswitch`.
+
+---
+
+## Setup
+
+```{r setup, message=FALSE}
+library(trtswitch)
+library(dplyr)
+library(ggplot2)
+
+data <- immdef %>% mutate(rx = 1 - xoyrs / progyrs)
+
+fit <- rpsftm(
+  data, id = "id", time = "progyrs", event = "prog", treat = "imm",
+  rx = "rx", censor_time = "censyrs",
+  n_eval_z = 101, recensor = TRUE, boot = FALSE
+)
+```
+
+---
+
+## RPSFTM-Specific Requirements (RPSFTM1–RPSFTM10)
+
+### RPSFTM1 — Statement around plausibility of common treatment effect assumption
+
+| Fulfilled? | **No — narrative requirement** |
+|:----------:|-------------------------------|
+
+**What TSD requires:** The analyst must provide a statement assessing whether the *common treatment effect assumption* is plausible. This assumption states that the causal acceleration factor $\psi$ is identical for all patients — those randomized to treatment from baseline and those who switched from control mid-trial. If switchers benefit less (e.g., because they cross over after disease progression when the drug is less efficacious), a single $\psi$ will over-correct their survival times and bias the adjusted HR.
+
+**Why narrative:** No statistical function can determine whether a clinical assumption is plausible. This requires domain expertise about the disease, mechanism of action, and reasons for switching.
+
+**How `rpsftm()` supports it:** The `treat_modifier` parameter enables quantitative sensitivity analyses (see RPSFTM10) that can accompany the narrative justification.
+
+---
+
+### RPSFTM2 — State and justify the structural model assumed (e.g., as-treated, ever-treated)
+
+| Fulfilled? | **Partial?** |
+|:----------:|-------------|
+
+**What TSD requires:** The analyst must state which structural model is used and why it is appropriate:
+
+- **As-treated model**: Only time actually receiving active treatment contributes to treated exposure. Treatment interruptions and time after discontinuation are excluded.
+- **Ever-treated model**: Once active treatment starts, subsequent follow-up is counted as treated even if treatment is later interrupted or discontinued. This should not be described as an intention-to-treat model because treatment must actually have started.
+
+The structural model determines how the counterfactual time is computed: $U_i = T_i[(1 - r_i) + r_i \cdot e^\psi]$.
+
+**Why partial:** The user prepares `rx` before calling `rpsftm()`. The function records the variable name in `fit$settings$rx`, but it cannot determine whether `rx` was derived using an as-treated or ever-treated rule, or justify that choice. The report must describe the exposure derivation and its clinical rationale.
+
+```{r rpsftm2}
+# Confirm the rx variable used
+fit$settings$rx
+
+# Inspect the rx distribution to characterize the model
+summary(data$rx)
+
+# Review the source derivation of rx; its distribution alone does not identify
+# how interruptions or discontinuations were handled.
+```
+
+---
+
+### RPSFTM3 — State the metric used for g-estimation and baseline variables
+
+| Fulfilled? | **Yes** |
+|:----------:|---------|
+
+**What TSD requires:** Report the test statistic used in g-estimation (typically a log-rank test or Cox score test) and any baseline covariates or stratification factors included. The choice of test affects the estimating equation $Z(\psi) = 0$ and can influence the point estimate when covariates are prognostic.
+
+**Why fulfilled:** `fit$settings$psi_test` reports the method: `"logrank"`, `"phreg"` (Cox), or `"lifereg"` (parametric AFT). Their adjustment behavior differs:
+
+- Log-rank does not use baseline covariates, but it can be stratified.
+- Cox uses both `base_cov` and `stratum`, with strata retained as stratification factors.
+- Parametric AFT uses `base_cov`; strata are converted to covariates. `strata_main_effect_only` controls whether they enter as main effects or as indicators for all strata combinations, and `aft_dist` records the assumed survival distribution.
+
+```{r rpsftm3}
+# Metric used for g-estimation
+fit$settings$psi_test
+
+# Baseline covariates (if any)
+fit$settings$base_cov
+
+# Stratification variables (if any)
+fit$settings$stratum
+
+# Additional settings relevant to parametric AFT g-estimation
+fit$settings$aft_dist
+fit$settings$strata_main_effect_only
+```
+
+---
+
+### RPSFTM4 — State the grid-search or interval bisection algorithm used
+
+| Fulfilled? | **Yes** |
+|:----------:|---------|
+
+**What TSD requires:** Report the numerical algorithm used to solve $Z(\psi) = 0$. Grid search evaluates the test statistic at many points and locates the zero crossing; root-finding methods (Brent, bisection) iteratively narrow an interval. The choice can matter when $Z(\psi)$ is non-monotone or has multiple roots.
+
+**Why fulfilled:** `fit$settings$gridsearch` indicates whether grid search was used. For grid search, report `low_psi`, `hi_psi`, and `n_eval_z`. For root finding, report the search interval, `root_finding` (`"brent"` or `"bisection"`), and convergence tolerance. Only report settings relevant to the selected algorithm.
+
+```{r rpsftm4}
+# Estimation method
+fit$settings$gridsearch
+
+fit$settings$root_finding
+fit$settings$tol
+
+# Grid parameters
+fit$settings$low_psi
+fit$settings$hi_psi
+fit$settings$n_eval_z
+
+# CI type confirms the method
+fit$psi_CI_type
+```
+
+---
+
+### RPSFTM5 — Plot g-estimation results to show the estimation process worked well
+
+| Fulfilled? | **Yes** |
+|:----------:|---------|
+
+**What TSD requires:** A plot of $Z(\psi)$ vs $\psi$ demonstrating that: (a) the curve crosses zero cleanly at a single point (unique solution), (b) the 95% CI bounds ($Z = \pm 1.96$) intersect at well-defined points, and (c) there are no pathological features (discontinuities, multiple crossings) that would indicate estimation problems.
+
+**Why fulfilled:** `fit$eval_z` contains the Z-statistic evaluated across the search range, and the first plot returned by `plot()` is the Z-plot. Ideally, the curve decreases monotonically, crosses zero once, and intersects the confidence-limit reference lines cleanly. Non-monotonic behavior or multiple roots should be investigated rather than interpreted as confirmation that estimation worked well.
+
+```{r rpsftm5}
+# The first returned plot is the Z-plot; the second is the adjusted-outcome KM plot
+rpsftm_plots <- plot(fit)
+rpsftm_plots[[1]]
+```
+
+---
+
+### RPSFTM6 — Present the estimated time ratio (or acceleration factor) and its CI
+
+| Fulfilled? | **Yes** |
+|:----------:|---------|
+
+**What TSD requires:** Report the estimated causal parameter $\hat\psi$ and its confidence interval. The acceleration factor $e^\psi$ represents how treatment scales survival time: $e^\psi > 1$ means treatment extends survival. Equivalently, the time ratio $e^{-\psi}$ represents the factor by which untreated time is compressed relative to treated time.
+
+**Why fulfilled:** `fit$psi` and `fit$psi_CI` provide the causal parameter and its CI. The causal survival time ratio and its CI are shown by the print method and can be calculated as `exp(-psi)`.
+
+```{r rpsftm6}
+# Causal parameter psi and CI
+fit$psi
+fit$psi_CI
+
+# Time ratio = exp(-psi)
+exp(-fit$psi)
+exp(-fit$psi_CI[2:1])  # note: CI bounds are reversed for exp(-psi)
+
+# Also displayed by the print method
+fit
+```
+
+---
+
+### RPSFTM7 — Compare counterfactual survival times between randomised groups in a KM plot
+
+| Fulfilled? | **Yes** |
+|:----------:|---------|
+
+**What TSD requires:** A Kaplan-Meier plot comparing counterfactual survival between treatment arms. Two perspectives are informative:
+
+1. **Counterfactual untreated survival** (`fit$kmstar`): Both arms mapped to "no treatment" using $\hat\psi$. Under the null of no treatment effect and a correct $\psi$, these curves should overlap — this validates the model.
+2. **Counterfactual unswitched survival** (`fit$km_outcome`): Treatment arm observed as-is, control arm adjusted to remove the benefit of switching. This is the basis for the adjusted HR.
+
+**Why fulfilled:** `fit$kmstar` supports the TSD-requested comparison of counterfactual untreated survival in both randomized groups and is useful for assessing g-estimation. This is distinct from `fit$km_outcome`, which compares observed survival in the randomized treatment group with counterfactual unswitched survival in the control group. The built-in `plot()` method renders the latter as its second plot; `kmstar` is plotted explicitly below.
+
+```{r rpsftm7}
+# KM plot of counterfactual untreated survival (validates psi estimate)
+ggplot(fit$kmstar, aes(x = time, y = surv, colour = factor(imm))) +
+  geom_step() +
+  labs(title = "Counterfactual Untreated Survival by Randomised Group",
+       x = "Time", y = "Survival Probability", colour = "Treatment") +
+  theme_bw()
+
+# Adjusted analysis plot: observed treatment versus counterfactual control
+rpsftm_plots <- plot(fit)
+rpsftm_plots[[2]]
+```
+
+---
+
+### RPSFTM8 — Detail the adjusted-data model, CI method, and survival extrapolation
+
+| Fulfilled? | **Partial — survival extrapolation is external** |
+|:----------:|--------------------------------------------------|
+
+**What TSD requires:** Describe the outcome model fitted to the counterfactual unswitched data, including the treatment-effect estimate, its confidence interval method, baseline adjustment, and any survival extrapolation.
+
+**What `rpsftm()` covers:** `fit$fit_outcome` is the fitted Cox model, `fit$hr` / `fit$hr_CI` give the hazard ratio and CI, and `fit$hr_CI_type` identifies the CI method. By default, the interval is matched to the ITT log-rank p-value rather than using the naive Cox-model interval; with `boot = TRUE`, a bootstrap interval is used. The settings record baseline covariates, strata, and tie handling.
+
+**What remains external:** `rpsftm()` does not extrapolate survival beyond the observed trial follow-up. If extrapolation is needed for an HTA or cost-effectiveness analysis, use `fit$data_outcome` as input to a separately selected parametric or flexible parametric survival model. The final report must identify and justify that model and its assumptions.
+
+```{r rpsftm8}
+# The fitted Cox model on counterfactual unswitched survival times
+fit$fit_outcome
+
+# Hazard ratio and CI
+fit$hr
+fit$hr_CI
+
+# CI construction method
+fit$hr_CI_type
+
+# Baseline covariates adjusted for
+fit$settings$base_cov
+fit$settings$stratum
+fit$settings$ties
+
+# Adjusted subject-level data available for external survival extrapolation
+head(fit$data_outcome)
+```
+
+---
+
+### RPSFTM9 — Present results both with and without re-censoring applied
+
+| Fulfilled? | **Yes** — requires running the function twice |
+|:----------:|-----------------------------------------------|
+
+**What TSD requires:** Report results under both re-censoring and no re-censoring. Re-censoring adjusts the administrative censoring time by the same acceleration factor used for event times: $C^* = C \cdot \min(1, e^\psi)$. This prevents informative censoring bias that arises because patients with longer counterfactual times (switchers who benefited most) would otherwise be selectively observed longer. Without re-censoring, more events are retained but the estimate may be biased.
+
+**Why fulfilled:** Running `rpsftm(..., recensor = TRUE)` and `rpsftm(..., recensor = FALSE)` produces both results. Comparing them reveals the sensitivity of the HR to the re-censoring assumption.
+
+```{r rpsftm9}
+# With re-censoring (default)
+fit_recensor <- rpsftm(
+  data, id = "id", time = "progyrs", event = "prog", treat = "imm",
+  rx = "rx", censor_time = "censyrs", recensor = TRUE, boot = FALSE
+)
+
+# Without re-censoring
+fit_no_recensor <- rpsftm(
+  data, id = "id", time = "progyrs", event = "prog", treat = "imm",
+  rx = "rx", censor_time = "censyrs", recensor = FALSE, boot = FALSE
+)
+
+# Compare treatment-effect estimates and uncertainty
+data.frame(
+  recensor = c("Yes", "No"),
+  psi      = c(fit_recensor$psi, fit_no_recensor$psi),
+  hr       = c(fit_recensor$hr, fit_no_recensor$hr),
+  hr_lower = c(fit_recensor$hr_CI[1], fit_no_recensor$hr_CI[1]),
+  hr_upper = c(fit_recensor$hr_CI[2], fit_no_recensor$hr_CI[2]),
+  pvalue   = c(fit_recensor$pvalue, fit_no_recensor$pvalue)
+)
+
+# The second plot presents the adjusted survival curves and HR for each analysis
+plot(fit_recensor)[[2]]
+plot(fit_no_recensor)[[2]]
+```
+
+---
+
+### RPSFTM10 — Report sensitivity analyses for key assumptions and extrapolation
+
+| Fulfilled? | **Partial — supported analyses plus external extrapolation** |
+|:----------:|---------------------------------------------------------------|
+
+**What TSD requires:** Demonstrate that treatment-effect estimates and survival extrapolations are robust to violations of key assumptions. Sensitivity around the common treatment effect assumption should be included, but it is not the only possible analysis.
+
+**How `treat_modifier` works:** The counterfactual time formula is $U_i = T_i[(1-r_i) + r_i \cdot e^{k\psi}]$, where $k$ is `treat_modifier`. With $k = 1$ (default), switchers receive the full treatment effect — the standard common treatment effect. With $k < 1$, switchers receive a diluted effect (e.g., $k = 0.5$ means they benefit half as much per unit time as patients randomized to treatment). Varying $k$ across a range produces a sensitivity table showing how the adjusted HR depends on this assumption.
+
+**Package-supported sensitivity analyses:** In addition to varying `treat_modifier`, analysts can vary baseline covariates or strata, compare the log-rank, Cox, and parametric AFT g-estimation methods, vary `aft_dist` for AFT analyses, and compare results with and without re-censoring (RPSFTM9). The choices should be clinically and statistically justified rather than treated as an exhaustive grid.
+
+**What remains external:** Sensitivity analyses for survival extrapolation must be performed after `rpsftm()` using `fit$data_outcome`, for example by comparing plausible parametric or flexible parametric survival models and assumptions. Report those analyses when extrapolation is part of the submission.
+
+```{r rpsftm10}
+# Sensitivity analysis: vary treat_modifier
+modifiers <- c(1.0, 0.75, 0.5, 0.25)
+
+sensitivity <- lapply(modifiers, function(m) {
+  f <- rpsftm(
+    data, id = "id", time = "progyrs", event = "prog", treat = "imm",
+    rx = "rx", censor_time = "censyrs",
+    treat_modifier = m, recensor = TRUE, boot = FALSE
+  )
+  data.frame(treat_modifier = m, psi = f$psi, hr = f$hr,
+             hr_lower = f$hr_CI[1], hr_upper = f$hr_CI[2])
+})
+
+do.call(rbind, sensitivity)
+```
+
+---
+
+## Summary
+
+| Requirement | Description | Fulfilled by `rpsftm()`? |
+|:-----------:|-------------|:------------------------:|
+| RPSFTM1 | Common treatment effect plausibility | No (narrative) |
+| RPSFTM2 | Structural model (as-treated/ever-treated) | Partial (`rx` definition) |
+| RPSFTM3 | G-estimation metric and covariates | Yes |
+| RPSFTM4 | Grid-search or root-finding algorithm | Yes |
+| RPSFTM5 | G-estimation plot | Yes |
+| RPSFTM6 | Time ratio and CI | Yes |
+| RPSFTM7 | Counterfactual KM plot | Yes |
+| RPSFTM8 | Outcome model, CI method, and survival extrapolation | Partial (extrapolation external) |
+| RPSFTM9 | Results with/without re-censoring | Yes (two calls) |
+| RPSFTM10 | Sensitivity analyses | Partial (extrapolation external) |
+
+`trtswitch::rpsftm()` fully supports six requirements and partially supports three.
+RPSFTM1 remains a clinical narrative requirement; RPSFTM2 requires a user-defined
+exposure derivation and justification; and the survival-extrapolation components
+of RPSFTM8 and RPSFTM10 require external post-processing.
